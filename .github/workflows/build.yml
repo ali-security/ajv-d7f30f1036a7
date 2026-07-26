@@ -5,33 +5,54 @@ on:
     branches: [master]
   pull_request:
     branches: ["*"]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
         node-version: [14.x, 16.x, 18.x, 19.x]
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: use Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-      - run: npm install
+      # --ignore-scripts: the `re2` devDep's install runs `node-gyp rebuild`,
+      # which fails (no prebuilt binary for these Node versions; node-gyp@13's
+      # undici throws `File is not defined`). re2 is only needed by the
+      # alternate-engine spec (skipped); its JS/.d.ts still resolve for tsc.
+      # The build is run explicitly below, so skipping lifecycle scripts is safe.
+      - run: npm install --ignore-scripts
+      # --ignore-scripts also skipped esbuild's postinstall, which fetches its
+      # platform binary (@esbuild/<platform>). module-from-string (used by the
+      # standalone-ESM codegen specs) needs it, so rebuild just esbuild to run
+      # only its install script — re2 is untouched and stays unbuilt.
+      - run: npm rebuild esbuild
       - run: git submodule update --init
-      - name: update website
-        if: ${{ github.event_name == 'push' && matrix.node-version == '14.x' }}
-        run: ./scripts/publish-site
-        env:
-          GH_TOKEN_PUBLIC: ${{ secrets.GH_TOKEN_PUBLIC }}
-          GIT_USER_EMAIL: ${{ secrets.GIT_USER_EMAIL }}
-          GIT_USER_NAME: ${{ secrets.GIT_USER_NAME }}
       - run: npm run build
-      - run: npm run test-ci
-      - name: coveralls
-        uses: coverallsapp/github-action@master
+      - name: test
+        run: |
+          npm run json-tests
+          # Self-link the package into its own node_modules so specs that
+          # `import "ajv"` resolve to this build, not the newer ajv that the
+          # ajv-formats devDep's peer range pulls in. A direct symlink is used
+          # instead of `npm link` (which writes to the global prefix and is
+          # permission-fragile on CI).
+          rm -rf node_modules/ajv
+          ln -s "$(pwd)" node_modules/ajv
+          npm run test-spec
+      - name: pack tarball
+        if: ${{ matrix.node-version == '19.x' }}
+        run: npm pack
+      - name: upload artifact
+        if: ${{ matrix.node-version == '19.x' }}
+        uses: actions/upload-artifact@v4
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          name: ajv-tarball
+          path: ajv-8.12.0.tgz
+          if-no-files-found: error
